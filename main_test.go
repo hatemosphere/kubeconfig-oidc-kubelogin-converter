@@ -9,17 +9,14 @@ import (
 )
 
 func TestBuildCacheKey_IncludesExtraScopes(t *testing.T) {
-	key := buildCacheKey("https://dex.example.com", "client", "secret")
-	if len(key.Provider.ExtraScopes) == 0 {
-		t.Fatal("buildCacheKey must include ExtraScopes to match kubelogin's cache key")
-	}
-	if key.Provider.ExtraScopes[0] != "profile" {
-		t.Errorf("ExtraScopes[0] = %q, want %q", key.Provider.ExtraScopes[0], "profile")
+	scopes := []string{"profile", "email", "offline_access", "groups"}
+	key := buildCacheKey("https://dex.example.com", "client", "secret", scopes)
+	if len(key.Provider.ExtraScopes) != 4 {
+		t.Fatalf("ExtraScopes length = %d, want 4", len(key.Provider.ExtraScopes))
 	}
 
 	// Verify key without scopes produces a different hash
-	keyNoScopes := key
-	keyNoScopes.Provider.ExtraScopes = nil
+	keyNoScopes := buildCacheKey("https://dex.example.com", "client", "secret", nil)
 	if cacheChecksum(key) == cacheChecksum(keyNoScopes) {
 		t.Error("cache key with and without ExtraScopes must produce different checksums")
 	}

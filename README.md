@@ -2,7 +2,9 @@
 
 Converts kubeconfig OIDC `auth-provider` entries to [kubelogin](https://github.com/int128/kubelogin) `exec` plugin format, and back.
 
-During conversion, existing `id-token` and `refresh-token` are injected into kubelogin's token cache so the first `kubectl` call after conversion works silently — no interactive login required. Tokens are stored in the OS keychain by default (macOS Keychain, Windows Credential Manager, Linux secret service) for security.
+During conversion, existing `id-token` and `refresh-token` are injected into kubelogin's token cache so the first `kubectl` call after conversion works silently — no interactive login required. OIDC scopes are automatically detected from the existing token claims. Tokens are stored in the OS keychain by default (macOS Keychain, Windows Credential Manager, Linux secret service) for security.
+
+Reverse conversion (`-reverse`) reads tokens back from kubelogin's cache into the kubeconfig, making the round-trip lossless.
 
 ## Why
 

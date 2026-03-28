@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
@@ -46,15 +47,59 @@ func cacheChecksum(key tokencache.Key) string {
 	return hex.EncodeToString(s.Sum(nil))
 }
 
-var extraScopes = []string{"profile", "email", "offline_access", "groups"}
+// claimToScope maps JWT claim names to the OIDC scopes that produce them.
+var claimToScope = map[string]string{
+	"email":          "email",
+	"email_verified": "email",
+	"name":           "profile",
+	"given_name":     "profile",
+	"family_name":    "profile",
+	"groups":         "groups",
+}
 
-func buildCacheKey(issuer, clientID, clientSecret string) tokencache.Key {
+// scopesFromToken decodes a JWT id-token (without verification) and infers
+// which extra OIDC scopes were used based on the claims present.
+// Always includes offline_access for refresh token support.
+func scopesFromToken(idToken string) []string {
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return []string{"offline_access"}
+	}
+	payload := parts[1]
+	if m := len(payload) % 4; m != 0 {
+		payload += strings.Repeat("=", 4-m)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return []string{"offline_access"}
+	}
+	var claims map[string]json.RawMessage
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return []string{"offline_access"}
+	}
+
+	seen := map[string]bool{"offline_access": true}
+	for claim, scope := range claimToScope {
+		if _, ok := claims[claim]; ok {
+			seen[scope] = true
+		}
+	}
+
+	scopes := make([]string, 0, len(seen))
+	for s := range seen {
+		scopes = append(scopes, s)
+	}
+	sort.Strings(scopes)
+	return scopes
+}
+
+func buildCacheKey(issuer, clientID, clientSecret string, scopes []string) tokencache.Key {
 	return tokencache.Key{
 		Provider: oidc.Provider{
 			IssuerURL:    issuer,
 			ClientID:     clientID,
 			ClientSecret: clientSecret,
-			ExtraScopes:  extraScopes,
+			ExtraScopes:  scopes,
 		},
 	}
 }
@@ -62,11 +107,11 @@ func buildCacheKey(issuer, clientID, clientSecret string) tokencache.Key {
 const keyringService = "kubelogin"
 const keyringItemPrefix = "kubelogin/tokencache/"
 
-func injectTokenCache(issuer, clientID, clientSecret, idToken, refreshToken string, useKeyring bool) {
+func injectTokenCache(issuer, clientID, clientSecret, idToken, refreshToken string, scopes []string, useKeyring bool) {
 	if idToken == "" && refreshToken == "" {
 		return
 	}
-	key := buildCacheKey(issuer, clientID, clientSecret)
+	key := buildCacheKey(issuer, clientID, clientSecret, scopes)
 	checksum := cacheChecksum(key)
 	data, err := json.Marshal(cacheEntity{IDToken: idToken, RefreshToken: refreshToken})
 	if err != nil {
@@ -87,14 +132,31 @@ func injectTokenCache(issuer, clientID, clientSecret, idToken, refreshToken stri
 	}
 }
 
-func removeTokenCache(issuer, clientID, clientSecret string, useKeyring bool) {
-	key := buildCacheKey(issuer, clientID, clientSecret)
+// readTokenCache reads tokens from the cache and then removes the entry.
+func readAndRemoveTokenCache(issuer, clientID, clientSecret string, scopes []string, useKeyring bool) (idToken, refreshToken string) {
+	key := buildCacheKey(issuer, clientID, clientSecret, scopes)
 	checksum := cacheChecksum(key)
+
+	var data []byte
 	if useKeyring {
+		s, err := keyring.Get(keyringService, keyringItemPrefix+checksum)
+		if err == nil {
+			data = []byte(s)
+		}
 		keyring.Delete(keyringService, keyringItemPrefix+checksum) // best-effort
 	} else {
-		os.Remove(filepath.Join(tokenCacheDir(), checksum)) // best-effort
+		path := filepath.Join(tokenCacheDir(), checksum)
+		data, _ = os.ReadFile(path)
+		os.Remove(path) // best-effort
 	}
+
+	if len(data) > 0 {
+		var entity cacheEntity
+		if err := json.Unmarshal(data, &entity); err == nil {
+			return entity.IDToken, entity.RefreshToken
+		}
+	}
+	return "", ""
 }
 
 var validGrantTypes = map[string]bool{
@@ -175,25 +237,27 @@ func runConvert(config *api.Config, kubeconfigPath string, noBackup bool, grantT
 		idToken := cfg["id-token"]
 		refreshToken := cfg["refresh-token"]
 
-		injectTokenCache(issuer, clientID, clientSecret, idToken, refreshToken, useKeyring)
+		scopes := scopesFromToken(idToken)
+
+		injectTokenCache(issuer, clientID, clientSecret, idToken, refreshToken, scopes, useKeyring)
 
 		authInfo.AuthProvider = nil
+		args := []string{
+			"oidc-login",
+			"get-token",
+			"--oidc-issuer-url=" + issuer,
+			"--oidc-client-id=" + clientID,
+			"--oidc-client-secret=" + clientSecret,
+			"--grant-type=" + grantType,
+			"--token-cache-storage=" + tokenCacheStorage,
+		}
+		for _, scope := range scopes {
+			args = append(args, "--oidc-extra-scope="+scope)
+		}
 		authInfo.Exec = &api.ExecConfig{
 			APIVersion: "client.authentication.k8s.io/v1beta1",
 			Command:    "kubectl",
-			Args: []string{
-				"oidc-login",
-				"get-token",
-				"--oidc-issuer-url=" + issuer,
-				"--oidc-client-id=" + clientID,
-				"--oidc-client-secret=" + clientSecret,
-				"--grant-type=" + grantType,
-				"--oidc-extra-scope=profile",
-				"--oidc-extra-scope=email",
-				"--oidc-extra-scope=offline_access",
-				"--oidc-extra-scope=groups",
-				"--token-cache-storage=" + tokenCacheStorage,
-			},
+			Args:       args,
 		}
 		converted = append(converted, name)
 	}
@@ -237,7 +301,14 @@ func runReverse(config *api.Config, kubeconfigPath string, noBackup bool, useKey
 
 		clientID := params["--oidc-client-id"]
 
-		removeTokenCache(params["--oidc-issuer-url"], clientID, params["--oidc-client-secret"], useKeyring)
+		// Extract scopes from exec args for cache key matching
+		var scopes []string
+		for _, arg := range args[2:] {
+			if strings.HasPrefix(arg, "--oidc-extra-scope=") {
+				scopes = append(scopes, strings.TrimPrefix(arg, "--oidc-extra-scope="))
+			}
+		}
+		cachedIDToken, cachedRefreshToken := readAndRemoveTokenCache(params["--oidc-issuer-url"], clientID, params["--oidc-client-secret"], scopes, useKeyring)
 
 		authInfo.Exec = nil
 		authInfo.AuthProvider = &api.AuthProviderConfig{
@@ -246,8 +317,8 @@ func runReverse(config *api.Config, kubeconfigPath string, noBackup bool, useKey
 				"client-id":      clientID,
 				"client-secret":  params["--oidc-client-secret"],
 				"idp-issuer-url": params["--oidc-issuer-url"],
-				"id-token":       "",
-				"refresh-token":  "",
+				"id-token":       cachedIDToken,
+				"refresh-token":  cachedRefreshToken,
 			},
 		}
 		converted = append(converted, name)
@@ -278,7 +349,7 @@ func runReverse(config *api.Config, kubeconfigPath string, noBackup bool, useKey
 	for _, name := range converted {
 		fmt.Printf("  - %s\n", name)
 	}
-	fmt.Println("\nNote: id-token and refresh-token are cleared — you'll need to re-authenticate.")
+	fmt.Println("\nNote: tokens from kubelogin cache have been restored to kubeconfig.")
 
 	writeConfig(config, kubeconfigPath)
 }
