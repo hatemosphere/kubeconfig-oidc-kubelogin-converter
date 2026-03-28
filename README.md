@@ -12,7 +12,7 @@ kubectl's built-in OIDC auth-provider (`auth-provider: name: oidc` in kubeconfig
 
 The in-tree auth-provider plugins were deprecated in Kubernetes v1.22 in favor of exec credential plugins ([KEP-541](https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/541-external-credential-providers)). The vendor-specific plugins (Azure, GCP) were removed in v1.26. The generic OIDC auth-provider still ships in v1.35 but is considered legacy and receives no fixes.
 
-[kubelogin](https://github.com/int128/kubelogin) is the recommended replacement — it handles token refresh with retries and backoff, supports multiple login flows (browser, device code, keyboard), and manages its own token cache.
+[kubelogin](https://github.com/int128/kubelogin) is the recommended replacement — it handles token refresh with retries and backoff, supports multiple login flows (browser, device code, keyboard), and manages its own token cache. Unlike the built-in auth-provider which stores tokens as plaintext in the kubeconfig file, kubelogin supports OS keychain storage (macOS Keychain, Windows Credential Manager, Linux secret service) where tokens are encrypted at rest.
 
 This tool automates the migration for any OIDC provider setup, converting all matching kubeconfig `auth-provider: oidc` entries in one shot and preserving existing tokens to avoid unnecessary re-authentication.
 
